@@ -40,6 +40,9 @@
   // Feedback tracking
   let feedback = {}; // key: url+match_poll_id, value: 'correct' or 'incorrect'
 
+  // Track first-seen dates for temp_poll_ids
+  let tempPollFirstSeen = {};
+
   async function fetchData() {
     // Use environment variable for production API base, fallback to Railway production URL
     const PROD_API_BASE = import.meta.env.VITE_API_BASE || 'https://pollfinder-production.up.railway.app';
@@ -134,6 +137,20 @@
         filteredData = [...data];
         applyFilters();
         sortData('added_on', false);
+
+        // Fetch first-seen dates for temp_poll_ids
+        const tempIds = [...new Set(data.filter(d => d.temp_poll_id && !d.match_poll_id).map(d => d.temp_poll_id))];
+        if (tempIds.length > 0) {
+          const apiBase = isDev ? 'http://localhost:3001' : PROD_API_BASE;
+          try {
+            const fsResp = await fetch(`${apiBase}/api/temp-poll-first-seen?ids=${tempIds.join(',')}`);
+            if (fsResp.ok) {
+              tempPollFirstSeen = await fsResp.json();
+            }
+          } catch (e) {
+            console.warn('Could not fetch temp poll first-seen dates:', e);
+          }
+        }
       }
     } catch (err) {
       error = err.message;
@@ -655,9 +672,14 @@
                         <span class="badge-value">{item[field]}</span>
                       <!-- </div> -->
                     {:else if field === 'match_results' && !item[field]}
-                      
+
                       <div style="margin-top:6px;">
-                        <span class="badge-potential">New Poll?</span>
+                        {#if item.temp_poll_id && tempPollFirstSeen[item.temp_poll_id]}
+                          {@const firstDate = new Date(tempPollFirstSeen[item.temp_poll_id])}
+                          <span class="badge-potential">First seen {firstDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
+                        {:else}
+                          <span class="badge-potential">New Poll?</span>
+                        {/if}
                       </div>
                       <span class="muted">No match found</span>
                     {:else if field === 'match_results' && item[field]}
@@ -689,9 +711,14 @@
                             </div>
                           </div>
                         {:else}
-                          <!-- Show a 'Potentially New Poll' badge when no matched poll exists -->
+                          <!-- Show first-seen date or 'Potentially New Poll' badge when no matched poll exists -->
                           <div style="margin-top:6px;">
-                            <span class="badge-potential">Potentially New Poll</span>
+                            {#if item.temp_poll_id && tempPollFirstSeen[item.temp_poll_id]}
+                              {@const firstDate = new Date(tempPollFirstSeen[item.temp_poll_id])}
+                              <span class="badge-potential">First seen {firstDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
+                            {:else}
+                              <span class="badge-potential">Potentially New Poll</span>
+                            {/if}
                           </div>
                                                     <span class="muted">No match found</span>
 
@@ -828,7 +855,11 @@
       <!-- Grouped View -->
       <div class="grouped-view">
         {#each Object.entries(groupedData).sort(([a, itemsA], [b, itemsB]) => {
-          // Prefer matched groups (not 'No Match') first
+          // Sort special groups to the end: not_enough_information last, No Match second-to-last
+          const aIsNEI = a === 'not_enough_information';
+          const bIsNEI = b === 'not_enough_information';
+          if (aIsNEI !== bIsNEI) return aIsNEI ? 1 : -1;
+
           const aIsNoMatch = a === 'No Match';
           const bIsNoMatch = b === 'No Match';
           if (aIsNoMatch !== bIsNoMatch) return aIsNoMatch ? 1 : -1;
@@ -846,23 +877,30 @@
                 {collapsedGroups[pollId] ? '▶' : '▼'}
               </button>
               <div class="header-content">
-                {#if pollId !== 'No Match'}
+                {#if pollId !== 'No Match' && pollId !== 'not_enough_information'}
                   {@const firstItem = items[0]}
                   {@const matchData = typeof firstItem.match_results === 'string' ? JSON.parse(firstItem.match_results) : firstItem.match_results}
-                  {@const pollster = matchData?.matches?.[0]?.matched_poll?.pollster || 'N/A'}
-                  {@const sponsor = matchData?.matches?.[0]?.matched_poll?.sponsor || 'N/A'}
-                  {@const startDate = matchData?.matches?.[0]?.matched_poll?.start_date || matchData?.matches?.[0]?.matched_poll?.date || 'N/A'}
-                  {@const endDate = matchData?.matches?.[0]?.matched_poll?.end_date || 'N/A'}
-                  {@const dateStr = endDate !== 'N/A' && endDate !== startDate ? `${startDate.slice(5)} to ${endDate.slice(5)}` : startDate.slice(5)}    
-                  {@const sampleSize = matchData?.matches?.[0]?.matched_poll?.sample_size || matchData?.matches?.[0]?.matched_poll?.sample || 'N/A'}
-                  
-                  <span class="poll-id-label">Poll ID:</span>
+                  {@const isTempPoll = !firstItem.match_poll_id && firstItem.temp_poll_id}
+                  {@const tempPollData = isTempPoll ? coercePoll((Array.isArray(firstItem.polls) ? firstItem.polls : [firstItem.polls])[0]) : null}
+                  {@const pollster = isTempPoll ? (tempPollData?.pollster || 'N/A') : (matchData?.matches?.[0]?.matched_poll?.pollster || 'N/A')}
+                  {@const sponsor = isTempPoll ? (tempPollData?.sponsor || 'N/A') : (matchData?.matches?.[0]?.matched_poll?.sponsor || 'N/A')}
+                  {@const startDate = isTempPoll ? (tempPollData?.start_date || tempPollData?.date || 'N/A') : (matchData?.matches?.[0]?.matched_poll?.start_date || matchData?.matches?.[0]?.matched_poll?.date || 'N/A')}
+                  {@const endDate = isTempPoll ? (tempPollData?.end_date || 'N/A') : (matchData?.matches?.[0]?.matched_poll?.end_date || 'N/A')}
+                  {@const fmtDate = (d) => { if (!d || d === 'N/A') return 'N/A'; return /^\d{4}-\d{2}/.test(d) ? d.slice(5) : d; }}
+                  {@const dateStr = endDate !== 'N/A' && endDate !== startDate ? `${fmtDate(startDate)} to ${fmtDate(endDate)}` : fmtDate(startDate)}
+                  {@const sampleSize = isTempPoll ? (tempPollData?.sample_size || tempPollData?.sample || 'N/A') : (matchData?.matches?.[0]?.matched_poll?.sample_size || matchData?.matches?.[0]?.matched_poll?.sample || 'N/A')}
+
+                  {#if isTempPoll}
+                    <span class="poll-id-label">Temp Poll ID:</span>
+                  {:else}
+                    <span class="poll-id-label">Poll ID:</span>
+                  {/if}
                   <span class="poll-id-value">{pollId}</span>
                   <span class="pollster-separator">•</span>
-                  
+
                   <span class="pollster-value">{pollster}</span>
                   <span class="pollster-separator">•</span>
-                  
+
                   {#if sponsor !== 'N/A'}
                     <span class="pollster-value">{sponsor}</span>
                     <span class="pollster-separator">•</span>
@@ -871,11 +909,15 @@
                   <span class="pollster-value">{dateStr}</span>
                   <span class="pollster-separator">•</span>
 
-                  
+
 
                 {:else}
                   <span class="poll-id-label">Status:</span>
-                  <span class="poll-id-value no-match">No Match</span>
+                  {#if pollId === 'not_enough_information'}
+                    <span class="poll-id-value no-match">Not Enough Information</span>
+                  {:else}
+                    <span class="poll-id-value no-match">No Match</span>
+                  {/if}
                 {/if}
               </div>
               <span class="article-count">{items.length} article{items.length !== 1 ? 's' : ''}</span>
@@ -956,7 +998,12 @@
                                 {#if item.temp_poll_id}
                                   <div class="temp-id-container">
                                     <span class="temp-id-badge">{item.temp_poll_id}</span>
-                                    <span class="new-poll-tag">New Poll</span>
+                                    {#if tempPollFirstSeen[item.temp_poll_id]}
+                                      {@const firstDate = new Date(tempPollFirstSeen[item.temp_poll_id])}
+                                      <span class="first-seen-tag">First seen {firstDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
+                                    {:else}
+                                      <span class="new-poll-tag">New Poll</span>
+                                    {/if}
                                   </div>
                                 {:else}
                                   N/A
@@ -990,7 +1037,12 @@
                                 {#if item.temp_poll_id}
                                   <div class="temp-id-container">
                                     <span class="temp-id-badge">{item.temp_poll_id}</span>
-                                    <span class="new-poll-tag">New Poll</span>
+                                    {#if tempPollFirstSeen[item.temp_poll_id]}
+                                      {@const firstDate = new Date(tempPollFirstSeen[item.temp_poll_id])}
+                                      <span class="first-seen-tag">First seen {firstDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
+                                    {:else}
+                                      <span class="new-poll-tag">New Poll</span>
+                                    {/if}
                                   </div>
                                 {:else}
                                   N/A
@@ -1023,571 +1075,702 @@
 </footer>
 
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@500..800&family=Inter:wght@400;500;600;700&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 
-  :root{
-    --ink: #111827;          /* near-black */
-    --ink-2:#374151;         /* gray-700 */
-    --ink-3:#6b7280;         /* gray-500 */
-    --paper:#ffffff;
-    --paper-2:#f8fafc;       /* page wash */
-    --line:#e5e7eb;          /* subtle rule */
-    --brand:#1f4db3;         /* ProPublica-like blue */
-    --brand-2:#0b3a8f;
-    --accent:#236bb1;
-    --warn:#b85d20;
-    /* --radius:14px; */
-    --shadow:0 6px 24px rgba(17,24,39,.06);
-  }
-
-  *{box-sizing:border-box}
-  html,body{margin:0;padding:0;background:var(--paper-2); color:var(--ink); font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji", "Segoe UI Symbol";}
-
-  h1{font-family:"Source Serif 4", Georgia, 'Times New Roman', serif; font-weight:800; font-size: clamp(32px, 4vw, 52px); line-height:1.05; letter-spacing:-.01em; margin:0 0 .35rem}
-  .dek{font-size:1.125rem; color:var(--ink-2); max-width:60ch; margin:.25rem 0 1.25rem}
-  a{color:var(--brand); text-decoration:none}
-  a:hover{text-decoration:underline}
-  .muted{color:var(--ink-3); font-size:0.85rem; line-height:1.2; margin-top: 2; font-style:italic}
-
-  .container{max-width:1152px; margin:0 auto; padding:0 20px}
-
-  /* HEADER */
-  .site-header{background:#0d1530; color:#fff; border-bottom:1px solid rgba(255,255,255,.08); position:sticky; top:0; z-index:50}
-  .site-header__inner{display:flex; align-items:center; justify-content:space-between; padding:14px 20px}
-  .brand{display:flex; align-items:center; gap:.6rem; color:#fff; text-decoration:none}
-  .brand__glyph{width:22px; height:22px; stroke:#9fb6ff; stroke-width:2.2; fill:none}
-  .brand__name{font-weight:800; letter-spacing:.2px}
-  .top-nav a{color:#c7d2fe; margin-left:18px; font-weight:600}
-  .top-nav a:hover{color:#fff}
-
-  /* HERO */
-  .hero{display:grid; grid-template-columns:1.2fr .8fr; gap:28px; padding:28px 0 10px}
-  .hero__copy{padding-top:8px}
-  .hero__art{display:flex; align-items:center; justify-content:flex-end}
-  .hero__art img{max-width:200px; width:100%}
-
-  /* FILTERS */
-  .filters{display:flex; gap:14px; flex-wrap:wrap; background:#eef2ff; border:1px solid #e0e7ff; padding:14px}
-  .field{display:flex; align-items:center; gap:10px}
-  label{font-weight:700; color:var(--brand)}
-  input[type="date"], select{
-    appearance:none;
-    padding:10px 12px;
-    border:1px solid #cbd5e1;
-    background:#fff;
-    font:inherit;
-    min-width:220px;
-    outline:none;
-    transition:border-color .15s ease;
-  }
-  input[type="date"]:focus, select:focus{border-color:#93c5fd}
-
-  /* VIEW TOGGLE */
-  .view-toggle{
-    display:flex;
-    gap:2px;
-    background:#f1f5f9;
-    padding:4px;
-    /* border-radius:12px; */
-    margin:20px 0;
-    width:fit-content;
-    border:1px solid #e2e8f0;
-  }
-  .view-btn{
-    display:flex;
-    align-items:center;
-    gap:8px;
-    padding:10px 16px;
-    border:none;
-    background:transparent;
-    color:var(--ink-2);
-    font-weight:600;
-    font-size:0.9rem;
-    cursor:pointer;
-    /* border-radius:8px; */
-    transition:all .2s ease;
-    white-space:nowrap;
-  }
-  .view-btn:hover{
-    background:rgba(255,255,255,0.5);
-    color:var(--ink);
-  }
-  .view-btn.active{
-    background:#fff;
-    color:var(--brand);
-    box-shadow:0 2px 4px rgba(0,0,0,0.1);
-  }
-  .view-icon{
-    width:18px;
-    height:18px;
-    flex-shrink:0;
+  :root {
+    --ink: #1a1a2e;
+    --ink-2: #4a4a68;
+    --ink-3: #8888a4;
+    --paper: #ffffff;
+    --paper-2: #f5f6fa;
+    --line: #e4e6ef;
+    --brand: #1e4a8a;
+    --brand-2: #163d72;
+    --brand-light: #eef2f9;
+    --accent: #0ea5e9;
+    --warn: #d97706;
+    --success: #059669;
+    --danger: #dc2626;
+    --radius-sm: 0;
+    --radius: 0;
+    --radius-lg: 0;
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
+    --shadow: 0 2px 8px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+    --shadow-lg: 0 8px 24px rgba(0,0,0,0.08), 0 2px 6px rgba(0,0,0,0.04);
+    --transition: 0.15s ease;
   }
 
-  .btn{
-    border:1px solid var(--line);
-    background:#fff;
-    padding:8px 12px;
-    font-weight:600;
-    cursor:pointer;
-    transition:all .2s ease;
-  }
-  .btn.ghost{background:transparent; color:var(--ink-2)}
-  .btn:hover{border-color:#cbd5e1}
-
-  /* FEEDBACK BUTTONS */
-  .feedback-buttons{
-    display:flex;
-    gap:8px;
-    flex-wrap:wrap;
-  }
-  .btn-feedback{
-    padding:6px 12px;
-    border:1px solid #cbd5e1;
-    background:#fff;
-    font-size:0.85rem;
-    font-weight:600;
-    cursor:pointer;
-    transition:all .2s ease;
-    /* border-radius:4px; */
-  }
-  .btn-feedback:hover{
-    border-color:#94a3b8;
-  }
-  .btn-feedback.selected{
-    background:#22c55e;
-    border-color:#16a34a;
-    color:#fff;
-  }
-  .btn-feedback:nth-child(2).selected{
-    background:#ef4444;
-    border-color:#dc2626;
-  }
-  .btn-feedback.btn-not-interested.selected{
-    background:#a9adb5;
-    border-color:#8d9199;
-    color:#fff;
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--paper-2);
+    color: var(--ink);
+    font-family: Inter, system-ui, -apple-system, sans-serif;
+    font-size: 15px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
   }
 
-  /* NOTES */
-  .notes-container{
-    display:flex;
-    flex-direction:column;
-    gap:8px;
+  h1 {
+    font-weight: 800;
+    font-size: clamp(28px, 3.5vw, 42px);
+    line-height: 1.1;
+    letter-spacing: -0.02em;
+    margin: 0 0 0.25rem;
+    color: var(--ink);
   }
-  .notes-input{
-    padding:8px 12px;
-    border:1px solid #cbd5e1;
-    /* border-radius:4px; */
-    font-size:0.85rem;
-    font-family:inherit;
-    background:#fff;
-    transition:border-color .2s ease;
-    resize:vertical;
-    min-height:60px;
-    max-width:250px;
+  .dek {
+    font-size: 1rem;
+    color: var(--ink-2);
+    max-width: 55ch;
+    margin: 0.25rem 0 1.5rem;
+    line-height: 1.6;
   }
-  .notes-input:focus{
-    outline:none;
-    border-color:#3b82f6;
-    box-shadow:0 0 0 3px rgba(59, 130, 246, 0.1);
-  }
-  .notes-input::placeholder{
-    color:#94a3b8;
+  a { color: var(--brand); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .muted {
+    color: var(--ink-3);
+    font-size: 0.8rem;
+    line-height: 1.3;
+    font-style: italic;
   }
 
-  /* CARDS */
-  .card{background:var(--paper); border:1px solid var(--line)}
-  .table-card{margin:18px 0 48px}
+  .container { max-width: 1200px; margin: 0 auto; padding: 0 24px; }
 
-  /* TABLE */
-  .table-scroll{overflow:auto}
-  table{width:100%; border-collapse:separate; border-spacing:0}
-  thead th{
-    position:sticky; top:0;
-    background:#f3f4f6;
-    font-weight:800;
-    text-transform:uppercase;
-    letter-spacing:.02em;
-    font-size:.78rem;
-    border-bottom:1px solid var(--line);
-    color:#374151;
-    padding:12px 10px;
+  /* ── HEADER ── */
+  .site-header {
+    background: #0f172a;
+    color: #fff;
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.2);
   }
-  th.sortable{cursor:pointer; user-select:none}
-  th.sortable:hover{background:#e5e7eb}
-  .sort{margin-left:6px; font-size:.75rem; color:#6b7280}
+  .site-header__inner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 24px;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: #fff;
+    text-decoration: none;
+  }
+  .brand__glyph {
+    width: 20px; height: 20px;
+    stroke: #60a5fa;
+    stroke-width: 2.2;
+    fill: none;
+  }
+  .brand__name {
+    font-weight: 800;
+    font-size: 1rem;
+    letter-spacing: 0.01em;
+  }
+  .top-nav a {
+    color: #94a3b8;
+    margin-left: 20px;
+    font-weight: 500;
+    font-size: 0.875rem;
+    transition: color var(--transition);
+  }
+  .top-nav a:hover { color: #fff; text-decoration: none; }
 
-  tbody td{padding:10px; border-top:1px solid var(--line); vertical-align:top; background:#fff}
-  tbody tr:nth-child(odd) td{background:#fcfcfd}
-  tbody tr:hover td{background:#f9fafb}
+  /* ── HERO ── */
+  .hero {
+    display: grid;
+    grid-template-columns: 1fr;
+    padding: 32px 0 8px;
+  }
+  .hero__copy { padding-top: 0; }
+  .hero__art { display: none; }
 
-  .datetime{
-    display:flex;
-    flex-direction:column;
-    gap:2px;
-    line-height:1.2;
-    white-space:nowrap;
+  /* ── FILTERS ── */
+  .filters {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    align-items: center;
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 12px 16px;
+    box-shadow: var(--shadow-sm);
   }
-  .datetime .date{
-    font-size:0.8rem;
-    font-weight:400;
-    color:var(--ink);
+  .field { display: flex; align-items: center; gap: 8px; }
+  label {
+    font-weight: 600;
+    font-size: 0.8rem;
+    color: var(--ink-2);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
   }
-  .datetime .time{
-    font-size:0.75rem;
-    color:var(--ink-3);
-    font-weight:400;
+  input[type="date"], select {
+    appearance: none;
+    padding: 8px 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    background: var(--paper);
+    font: inherit;
+    font-size: 0.875rem;
+    min-width: 200px;
+    outline: none;
+    transition: border-color var(--transition), box-shadow var(--transition);
   }
-
-  .url-link{
-    display:flex;
-    flex-direction:column;
-    gap:2px;
-    text-decoration:none;
-    color:inherit;
-    line-height:1.3;
-    max-width:300px;
-  }
-  .url-link:hover{
-    opacity:0.8;
-  }
-  .url-link:hover .url-domain{
-    text-decoration:underline;
-  }
-  .url-domain{
-    font-size:0.9rem;
-    font-weight:600;
-    color:var(--brand);
-  }
-  .url-path{
-    font-size:0.75rem;
-    color:var(--ink-3);
-    font-family:monospace;
-    word-break:break-all;
-  }
-
-  .poll-id-badge{
-    display:inline-flex;
-    align-items:center;
-    gap:6px;
-    background:#eff6ff;
-    border:1px solid #bfdbfe;
-    padding:6px 12px;
-  }
-  .badge-label{
-    font-size:0.7rem;
-    font-weight:700;
-    color:#1e40af;
-    text-transform:uppercase;
-    letter-spacing:0.03em;
-  }
-  .badge-value{
-    font-size:0.85rem;
-    font-weight:600;
-    color:#1e3a8a;
-    font-family:monospace;
+  input[type="date"]:focus, select:focus {
+    border-color: var(--brand);
+    box-shadow: 0 0 0 3px rgba(30, 74, 138, 0.1);
   }
 
-  .badge-potential{
-    display:inline-block;
-    padding:4px 8px;
-    margin-bottom: 0.5rem;
-    font-size:0.75rem;
-    font-weight:600;
-    color:#374151; /* slate-700 */
-    background:#fffa77; /* gray-100 */
-    border:1px solid #cf643e; /* gray-200 */
-    /* border-radius:9999px; */
+  /* ── VIEW TOGGLE ── */
+  .view-toggle {
+    display: flex;
+    gap: 0;
+    background: var(--paper);
+    padding: 3px;
+    border-radius: var(--radius);
+    margin: 20px 0;
+    width: fit-content;
+    border: 1px solid var(--line);
+    box-shadow: var(--shadow-sm);
+  }
+  .view-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 16px;
+    border: none;
+    background: transparent;
+    color: var(--ink-3);
+    font-weight: 600;
+    font-size: 0.825rem;
+    cursor: pointer;
+    border-radius: calc(var(--radius) - 3px);
+    transition: all var(--transition);
+    white-space: nowrap;
+  }
+  .view-btn:hover {
+    color: var(--ink-2);
+    background: var(--paper-2);
+  }
+  .view-btn.active {
+    background: var(--brand);
+    color: #fff;
+    box-shadow: none;
+  }
+  .view-icon { width: 16px; height: 16px; flex-shrink: 0; }
+
+  .btn {
+    border: 1px solid var(--line);
+    background: var(--paper);
+    padding: 8px 14px;
+    font-weight: 600;
+    font-size: 0.825rem;
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+    transition: all var(--transition);
+  }
+  .btn.ghost { background: transparent; color: var(--ink-3); }
+  .btn:hover {
+    border-color: #cbd5e1;
+    background: var(--paper-2);
   }
 
-  .match-card{
-    display:flex;
-    flex-direction:column;
-    gap:6px;
-    padding:10px;
-    background:#f8fafc;
-    border:1px solid #e2e8f0;
-    min-width:250px;
+  /* ── FEEDBACK BUTTONS ── */
+  .feedback-buttons {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
   }
-  .match-field{
-    display:flex;
-    gap:8px;
-    font-size:0.85rem;
-    line-height:1.4;
+  .btn-feedback {
+    padding: 5px 10px;
+    border: 1px solid var(--line);
+    background: var(--paper);
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+    transition: all var(--transition);
   }
-  .field-label{
-    font-weight:600;
-    color:var(--ink-2);
-    min-width:70px;
-    flex-shrink:0;
+  .btn-feedback:hover {
+    border-color: #94a3b8;
+    background: var(--paper-2);
   }
-  .field-value{
-    color:var(--ink);
-    font-weight:400;
+  .btn-feedback.selected {
+    background: var(--success);
+    border-color: var(--success);
+    color: #fff;
   }
-
-  .polls-card{
-    display:flex;
-    flex-direction:column;
-    gap:6px;
-    padding:10px;
-    background:#f8fafc;
-    border:1px solid #e2e8f0;
-    min-width:250px;
+  .btn-feedback:nth-child(2).selected {
+    background: var(--danger);
+    border-color: var(--danger);
   }
-  .poll-more{
-    font-size:0.75rem;
-    color:var(--ink-3);
-    font-style:italic;
-    padding-top:4px;
-    border-top:1px solid #e2e8f0;
-    margin-top:2px;
+  .btn-feedback.btn-not-interested.selected {
+    background: #94a3b8;
+    border-color: #94a3b8;
+    color: #fff;
   }
 
-  /* GROUPED VIEW */
-  .grouped-view{
-    display:flex;
-    flex-direction:column;
-    gap:32px;
+  /* ── NOTES ── */
+  .notes-container {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
   }
-  .group-card{
-    background:var(--paper);
-    border:1px solid #e2e8f0;
-    padding:0;
-    overflow:hidden;
-    box-shadow:0 1px 3px rgba(0,0,0,0.08);
-    transition:all .2s ease;
+  .notes-input {
+    padding: 8px 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    font-size: 0.825rem;
+    font-family: inherit;
+    background: var(--paper);
+    transition: border-color var(--transition), box-shadow var(--transition);
+    resize: vertical;
+    min-height: 60px;
+    max-width: 250px;
   }
-  .group-card:hover{
-    box-shadow:0 2px 8px rgba(0,0,0,0.12);
-    border-color:#cbd5e1;
+  .notes-input:focus {
+    outline: none;
+    border-color: var(--brand);
+    box-shadow: 0 0 0 3px rgba(30, 74, 138, 0.1);
+  }
+  .notes-input::placeholder { color: #b0b4c0; }
+
+  /* ── CARDS ── */
+  .card {
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+  }
+  .table-card { margin: 16px 0 48px; }
+
+  /* ── TABLE ── */
+  .table-scroll { overflow: auto; border-radius: var(--radius); }
+  table { width: 100%; border-collapse: separate; border-spacing: 0; }
+  thead th {
+    position: sticky; top: 0;
+    background: var(--paper-2);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 0.7rem;
+    border-bottom: 1px solid var(--line);
+    color: var(--ink-3);
+    padding: 10px 12px;
+  }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { background: #eceef5; }
+  .sort { margin-left: 4px; font-size: 0.7rem; color: var(--ink-3); }
+
+  tbody td {
+    padding: 10px 12px;
+    border-top: 1px solid var(--line);
+    vertical-align: top;
+    background: var(--paper);
+    font-size: 0.875rem;
+  }
+  tbody tr:nth-child(odd) td { background: #fafafc; }
+  tbody tr:hover td { background: #f0f2f8; }
+
+  .datetime {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    line-height: 1.3;
+    white-space: nowrap;
+  }
+  .datetime .date {
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--ink);
+  }
+  .datetime .time {
+    font-size: 0.7rem;
+    color: var(--ink-3);
   }
 
-  .group-header-row{
-    display:flex;
-    align-items:center;
-    gap:16px;
-    padding:14px 20px;
-    background:linear-gradient(135deg, #f1f5f9 0%, #e2e8f0 100%);
-    border-bottom:1px solid #cbd5e1;
-    cursor:pointer;
-    transition:background 0.2s ease;
+  .url-link {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    text-decoration: none;
+    color: inherit;
+    line-height: 1.3;
+    max-width: 300px;
   }
-  .group-header-row:hover{
-    background:linear-gradient(135deg, #e2e8f0 0%, #cbd5e1 100%);
+  .url-link:hover { opacity: 0.85; }
+  .url-link:hover .url-domain { text-decoration: underline; }
+  .url-domain {
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--brand);
   }
-
-  .collapse-btn{
-    background:transparent;
-    border:1px solid #cbd5e1;
-    padding:4px 8px;
-    font-size:0.85rem;
-    cursor:pointer;
-    transition:all 0.2s ease;
-    color:var(--ink-2);
-    flex-shrink:0;
-  }
-  .collapse-btn:hover{
-    background:#fff;
-    border-color:#94a3b8;
+  .url-path {
+    font-size: 0.7rem;
+    color: var(--ink-3);
+    font-family: 'SF Mono', Menlo, monospace;
+    word-break: break-all;
   }
 
-  .header-content{
-    display:flex;
-    gap:8px;
-    align-items:center;
-    flex:1;
+  .poll-id-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--brand-light);
+    border: 1px solid #bfdbfe;
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
   }
-  .poll-id-label{
-    font-size:0.75rem;
-    font-weight:700;
-    color:#64748b;
-    text-transform:uppercase;
-    letter-spacing:0.05em;
+  .badge-label {
+    font-size: 0.65rem;
+    font-weight: 700;
+    color: var(--brand-2);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
   }
-  .poll-id-value{
-    font-size:0.95rem;
-    font-weight:700;
-    color:var(--brand);
-  }
-  .poll-id-value.no-match{
-    color:#ef4444;
-  }
-
-  .pollster-separator{
-    color:#cbd5e1;
-    margin:0 8px;
-  }
-  .pollster-label{
-    font-size:0.75rem;
-    font-weight:700;
-    color:#64748b;
-    text-transform:uppercase;
-    letter-spacing:0.05em;
-  }
-  .pollster-value{
-    font-size:0.9rem;
-    font-weight:600;
-    color:#1f4db3;
+  .badge-value {
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--brand-2);
+    font-family: 'SF Mono', Menlo, monospace;
   }
 
-  .article-count{
-    margin-left:auto;
-    font-size:0.8rem;
-    font-weight:600;
-    color:#64748b;
-    background:rgba(255,255,255,0.6);
-    padding:4px 10px;
-    border:1px solid #cbd5e1;
-  }
-  .group-card .match-card{
-    display:none;
-  }
-  .match-title{
-    font-size:0.95rem;
-    font-weight:700;
-    color:var(--ink-2);
-    margin:0 0 8px;
-  }
-  .items-title{
-    font-size:0.9rem;
-    font-weight:700;
-    color:var(--ink-2);
-    margin:0 0 12px;
-  }
-  .group-table-wrapper{
-    overflow-x:auto;
-    margin-top:0;
-    border:1px solid rgba(0,0,0,0.08);
-    /* border-radius:12px; */
-    overflow:hidden;
-    box-shadow:0 2px 8px rgba(0,0,0,0.06);
-    background:#fff;
-  }
-  .group-table{
-    width:100%;
-    border-collapse:collapse;
-    font-size:0.85rem;
-    background:#fff;
-    table-layout:fixed;
-  }
-  .group-table th{
-    text-align:left;
-    padding:16px 20px;
-    font-weight:700;
-    color:var(--ink-2);
-    white-space:nowrap;
-    font-size:0.8rem;
-    text-transform:uppercase;
-    letter-spacing:0.02em;
-    width:16.66%;
-  }
-  .group-table td{
-    padding:16px 20px;
-    border-bottom:1px solid rgba(0,0,0,0.06);
-    color:var(--ink);
-    vertical-align:top;
-  }
-  .group-table tbody tr{
-    transition:all 0.2s ease;
-  }
-  .group-table tbody tr:hover{
-    background:linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
-    transform:translateY(-1px);
-    box-shadow:0 4px 12px rgba(0,0,0,0.08);
-  }
-  
-  .temp-id-container{
-    display:flex;
-    gap:8px;
-    align-items:center;
-    flex-wrap:wrap;
-  }
-  .temp-id-badge{
-    font-family:monospace;
-    font-size:0.8rem;
-    color:var(--brand);
-    font-weight:600;
-    background:#eef2ff;
-    padding:4px 8px;
-    border-radius:4px;
-    border:1px solid #c7d2fe;
-  }
-  .new-poll-tag{
-    font-size:0.7rem;
-    font-weight:700;
-    color:#fff;
-    background:#10b981;
-    padding:2px 6px;
-    border-radius:3px;
-    text-transform:uppercase;
-    letter-spacing:0.5px;
-  }
-  .date-cell{
-    white-space:nowrap;
-  }
-  .date-cell .date{
-    font-weight:600;
-    font-size:0.9rem;
-  }
-  .date-cell .time{
-    font-size:0.75rem;
-    color:var(--ink-3);
-  }
-  .url-cell a{
-    text-decoration:none;
-    color:inherit;
-  }
-  .url-cell a:hover{
-    text-decoration:underline;
-  }
-  .url-cell .url-domain{
-    font-weight:600;
-    color:var(--brand);
-    display:block;
-  }
-  .url-cell .url-path{
-    font-size:0.75rem;
-    color:var(--ink-3);
-    font-family:monospace;
-    display:block;
+  .badge-potential {
+    display: inline-block;
+    padding: 3px 8px;
+    margin-bottom: 0.4rem;
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: #92400e;
+    background: #fef3c7;
+    border: 1px solid #fcd34d;
+    border-radius: 0;
   }
 
-  .link-wrap{word-break:break-word}
-  .json{
-    background:#f8fafc;
-    border:1px solid #e5e7eb;
-    padding:8px;
-    font-size:.85rem;
-    max-width:360px;
-    overflow:auto;
+  .match-card {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 10px 12px;
+    background: #f8f9fc;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    min-width: 240px;
+  }
+  .match-field {
+    display: flex;
+    gap: 8px;
+    font-size: 0.8rem;
+    line-height: 1.4;
+  }
+  .field-label {
+    font-weight: 600;
+    color: var(--ink-3);
+    min-width: 65px;
+    flex-shrink: 0;
+  }
+  .field-value {
+    color: var(--ink);
+    font-weight: 400;
   }
 
-  /* NOTICES */
-  .notice{background:#eef2ff; border:1px solid #dbeafe; color:#1e3a8a; padding:12px 14px; margin:16px 0;}
-  .notice.error{background:#fff1f2; border-color:#fecdd3; color:#991b1b}
-
-  /* FOOTER */
-  .site-footer{border-top:1px solid var(--line); background:#fff}
-  .footer-inner{padding:32px 20px}
-
-  /* RESPONSIVE */
-  @media (max-width: 960px){
-    .hero{grid-template-columns:1fr; gap:14px}
-    .hero__art{justify-content:flex-start}
-    .hero__art img{max-width:150px}
+  .polls-card {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 10px 12px;
+    background: #f8f9fc;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    min-width: 240px;
+  }
+  .poll-more {
+    font-size: 0.7rem;
+    color: var(--ink-3);
+    font-style: italic;
+    padding-top: 4px;
+    border-top: 1px solid var(--line);
+    margin-top: 2px;
   }
 
-  .table-card .data-table a{color:var(--warn)}
-  .table-card .data-table a:hover{opacity:.9}
-    .table-card{
-    margin:18px 0 48px;
-    width:100%;
-    overflow-x:visible;
+  /* ── GROUPED VIEW ── */
+  .grouped-view {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    padding-bottom: 32px;
   }
-  .table-card .data-table{
-    table-layout:auto;
-    width:100%;
-    min-width:auto;
+  .group-card {
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 0;
+    overflow: hidden;
+    box-shadow: var(--shadow);
+    transition: box-shadow var(--transition), border-color var(--transition);
+  }
+  .group-card:hover {
+    border-color: #c8ccd8;
+  }
+
+  .group-header-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 18px;
+    background: var(--paper-2);
+    border-bottom: 1px solid var(--line);
+    cursor: pointer;
+    transition: background var(--transition);
+  }
+  .group-header-row:hover {
+    background: #eceef5;
+  }
+
+  .collapse-btn {
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    padding: 2px 7px;
+    font-size: 0.75rem;
+    cursor: pointer;
+    transition: all var(--transition);
+    color: var(--ink-3);
+    flex-shrink: 0;
+    line-height: 1.4;
+  }
+  .collapse-btn:hover {
+    background: var(--paper);
+    border-color: #94a3b8;
+    color: var(--ink);
+  }
+
+  .header-content {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    flex: 1;
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+  .poll-id-label {
+    font-size: 0.65rem;
+    font-weight: 700;
+    color: var(--ink-3);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .poll-id-value {
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--brand);
+    font-family: 'SF Mono', Menlo, monospace;
+  }
+  .poll-id-value.no-match {
+    color: var(--danger);
+    font-family: inherit;
+  }
+
+  .pollster-separator {
+    color: #d0d4e0;
+    margin: 0 4px;
+    font-size: 0.7rem;
+  }
+  .pollster-label {
+    font-size: 0.65rem;
+    font-weight: 700;
+    color: var(--ink-3);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .pollster-value {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--ink);
+  }
+
+  .article-count {
+    margin-left: auto;
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: var(--ink-3);
+    background: var(--paper);
+    padding: 3px 10px;
+    border: 1px solid var(--line);
+    border-radius: 0;
+    white-space: nowrap;
+  }
+  .group-card .match-card { display: none; }
+  .match-title {
+    font-size: 0.875rem;
+    font-weight: 700;
+    color: var(--ink-2);
+    margin: 0 0 8px;
+  }
+  .items-title {
+    font-size: 0.825rem;
+    font-weight: 700;
+    color: var(--ink-2);
+    margin: 0 0 12px;
+  }
+  .group-table-wrapper {
+    overflow-x: auto;
+    margin-top: 0;
+    background: var(--paper);
+  }
+  .group-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.825rem;
+    background: var(--paper);
+    table-layout: fixed;
+  }
+  .group-table th {
+    text-align: left;
+    padding: 10px 18px;
+    font-weight: 700;
+    color: var(--ink-3);
+    white-space: nowrap;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    width: 16.66%;
+    border-bottom: 1px solid var(--line);
+    background: #fafafc;
+  }
+  .group-table td {
+    padding: 12px 18px;
+    border-bottom: 1px solid #f0f1f5;
+    color: var(--ink);
+    vertical-align: top;
+  }
+  .group-table tbody tr {
+    transition: background var(--transition);
+  }
+  .group-table tbody tr:hover {
+    background: #f5f6fa;
+  }
+  .group-table tbody tr:last-child td {
+    border-bottom: none;
+  }
+
+  .temp-id-container {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .temp-id-badge {
+    font-family: 'SF Mono', Menlo, monospace;
+    font-size: 0.75rem;
+    color: var(--brand);
+    font-weight: 600;
+    background: var(--brand-light);
+    padding: 2px 8px;
+    border: 1px solid #c7d2fe;
+  }
+  .new-poll-tag {
+    font-size: 0.65rem;
+    font-weight: 700;
+    color: #fff;
+    background: var(--success);
+    padding: 2px 7px;
+    border-radius: 0;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .first-seen-tag {
+    font-size: 0.65rem;
+    font-weight: 700;
+    color: #fff;
+    background: #6366f1;
+    padding: 2px 7px;
+    border-radius: 0;
+    letter-spacing: 0.02em;
+  }
+  .date-cell { white-space: nowrap; }
+  .date-cell .date {
+    font-weight: 600;
+    font-size: 0.825rem;
+  }
+  .date-cell .time {
+    font-size: 0.7rem;
+    color: var(--ink-3);
+  }
+  .url-cell a {
+    text-decoration: none;
+    color: inherit;
+  }
+  .url-cell a:hover .url-domain { text-decoration: underline; }
+  .url-cell .url-domain {
+    font-weight: 600;
+    color: var(--brand);
+    display: block;
+    font-size: 0.825rem;
+  }
+  .url-cell .url-path {
+    font-size: 0.7rem;
+    color: var(--ink-3);
+    font-family: 'SF Mono', Menlo, monospace;
+    display: block;
+  }
+
+  .link-wrap { word-break: break-word; }
+  .json {
+    background: #f8f9fc;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    padding: 8px;
+    font-size: 0.8rem;
+    max-width: 360px;
+    overflow: auto;
+  }
+
+  /* ── NOTICES ── */
+  .notice {
+    background: var(--brand-light);
+    border: 1px solid #bfdbfe;
+    color: var(--brand-2);
+    padding: 12px 16px;
+    margin: 16px 0;
+    border-radius: var(--radius);
+    font-size: 0.875rem;
+    font-weight: 500;
+  }
+  .notice.error {
+    background: #fef2f2;
+    border-color: #fecaca;
+    color: #991b1b;
+  }
+
+  /* ── FOOTER ── */
+  .site-footer {
+    border-top: 1px solid var(--line);
+    background: var(--paper);
+    margin-top: 24px;
+  }
+  .footer-inner { padding: 24px; }
+
+  /* ── RESPONSIVE ── */
+  @media (max-width: 960px) {
+    .hero { grid-template-columns: 1fr; }
+    .container { padding: 0 16px; }
+  }
+
+  .table-card .data-table a { color: var(--brand); }
+  .table-card .data-table a:hover { opacity: 0.85; }
+  .table-card {
+    margin: 16px 0 48px;
+    width: 100%;
+    overflow-x: visible;
+  }
+  .table-card .data-table {
+    table-layout: auto;
+    width: 100%;
+    min-width: auto;
   }
 </style>

@@ -178,6 +178,35 @@ app.post('/api/notes', async (req, res) => {
   }
 });
 
+// Endpoint to get the first-seen date for temp_poll_ids
+app.get('/api/temp-poll-first-seen', async (req, res) => {
+  try {
+    const { ids } = req.query;
+    if (!ids) {
+      return res.status(400).json({ error: 'Missing ids parameter' });
+    }
+
+    const tempPollIds = ids.split(',').filter(Boolean);
+    console.log(`🔍 Looking up first-seen dates for ${tempPollIds.length} temp_poll_ids`);
+
+    const pipeline = [
+      { $match: { temp_poll_id: { $in: tempPollIds } } },
+      { $group: { _id: '$temp_poll_id', first_seen: { $min: '$added_on' } } }
+    ];
+
+    const results = await expandedPolls.aggregate(pipeline).toArray();
+    const firstSeenMap = {};
+    results.forEach(r => {
+      firstSeenMap[r._id] = r.first_seen;
+    });
+
+    res.json(firstSeenMap);
+  } catch (error) {
+    console.error('❌ Error fetching temp poll first-seen dates:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Root endpoint
 app.get('/', (req, res) => {
   res.json({ 
